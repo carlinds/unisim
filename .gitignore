@@ -1,0 +1,20 @@
+# nerfstudio outputs
+outputs/
+
+# default data directory (for symlinking)
+data/
+
+# virtual environment
+.venv/
+
+# python stuff
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyz
+*.pyw
+*.pyi
+*.egg-info/
+dist/
+build/
