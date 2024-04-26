@@ -33,7 +33,6 @@ from jaxtyping import Float, Int
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.cameras.lidars import transform_points_pairwise
 from nerfstudio.cameras.rays import RayBundle, RaySamples
-from nerfstudio.data.dataparsers.pandaset_dataparser import ALLOWED_RIGID_CLASSES
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.field_components.encodings import HashEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
@@ -47,7 +46,6 @@ from nerfstudio.model_components.utils import SigmoidDensity
 from nerfstudio.models.ad_model import ADModel, ADModelConfig
 from nerfstudio.utils import colormaps
 from nerfstudio.utils.math import GaussiansStd, chamfer_distance, erf_approx
-from nerfstudio.viewer.server.viewer_elements import ViewerCheckbox, ViewerSlider
 from torch import Tensor
 from torch.nn import BCEWithLogitsLoss, Parameter
 from torchmetrics.functional import structural_similarity_index_measure
@@ -121,9 +119,6 @@ class UniSimModelConfig(ADModelConfig):
     """Dimensionality of the hidden layers in the hypernet."""
     use_random_flip: bool = True
     """Whether to randomly flip the sign of positions and directions fed to actor networks."""
-    use_class_specific_embedding: bool = False
-    """Whether to use class-specific embeddings for actors."""
-    use_shared_actor_embedding: bool = False
 
     rgb_decoder_type: RGBDecoderType = "cnn"
     """What type of image (rgb) decoder to use."""
@@ -160,10 +155,6 @@ class UniSimModelConfig(ADModelConfig):
     """Epsilon for regularization loss, in meters."""
     quantile_threshold: float = 0.95
     """Quantile threshold for lidar and regularization losses."""
-    actor_norm_loss_mult: float = 0.1
-    """Multipier for actor norm loss"""
-    actor_motion_model_regularization_loss_mult: float = 0.0
-    """Multipier for actor motion model regularization loss"""
 
     numerical_gradients_delta: float = 0.01
     """Delta for numerical gradients, in meters."""
@@ -265,40 +256,11 @@ class UniSimModel(ADModel):
             model_lidar_return_prob=self.config.model_lidar_return_prob,
         )
 
-        assert (
-            "trajectories" in self.kwargs["metadata"].keys()
-        ), "Metadata must contain trajectories for dynamic agents."
-        trajectories = self.kwargs["metadata"]["trajectories"]
         aabbs = torch.stack(
             [-self.dynamic_actors.actor_sizes / 2, self.dynamic_actors.actor_sizes / 2],
             dim=1,
         )
         self.register_buffer("actor_aabbs", aabbs)
-        # self.dynamic_actors.n_actors = len(trajectories)
-        if self.config.use_class_specific_embedding:
-            # TODO: ugly import of classes, only supports pandaset for now
-            self.class_idx_map = {cls_name: i for i, cls_name in enumerate(ALLOWED_RIGID_CLASSES)}
-            actor_classes = torch.tensor([self.class_idx_map[traj["label"]] for traj in trajectories])
-            self.register_buffer("actor_classes", actor_classes)
-
-        assert not (
-            self.config.use_class_specific_embedding and self.config.use_shared_actor_embedding
-        ), "Cannot use both class-specific and shared actor embeddings"
-
-        if self.config.use_class_specific_embedding:
-            self.class_slider = ViewerSlider(
-                "Class index",
-                -1.0,
-                -1.0,
-                len(self.class_idx_map) - 1,
-                1.0,
-            )
-            self.only_render_class = ViewerCheckbox("Only render class embedding", False)
-            self.only_render_actor = ViewerCheckbox("Only render actor embedding", False)
-
-        if self.config.use_shared_actor_embedding:
-            self.only_render_shared = ViewerCheckbox("Only render shared embedding", False)
-            self.only_render_actor = ViewerCheckbox("Only render actor embedding", False)
 
         dynamic_field = GaussianUniSimField if self.config.dynamic_use_gauss_field else UniSimField
         self.dynamic_field = dynamic_field(
@@ -334,17 +296,6 @@ class UniSimModel(ADModel):
                 implementation=hypernet_implementation,
             )
 
-            if self.config.use_class_specific_embedding:
-                self.actor_embedding = torch.nn.Embedding(self.dynamic_actors.n_actors, self.config.actor_embedding_dim)
-                self.actor_embedding.weight = torch.nn.Parameter(self.actor_embedding.weight * 0.001)
-                self.class_embedding = torch.nn.Embedding(len(ALLOWED_RIGID_CLASSES), self.config.actor_embedding_dim)
-                self.class_embedding.weight = torch.nn.Parameter(self.class_embedding.weight * 0.001)
-
-            if self.config.use_shared_actor_embedding:
-                self.actor_embedding = torch.nn.Embedding(self.dynamic_actors.n_actors, self.config.actor_embedding_dim)
-                self.actor_embedding.weight = torch.nn.Parameter(self.actor_embedding.weight * 0.001)
-                self.shared_actor_embedding = torch.nn.Embedding(1, self.config.actor_embedding_dim)
-                self.shared_actor_embedding.weight = torch.nn.Parameter(self.shared_actor_embedding.weight * 0.001)
         else:
             # TODO: delete the current hashgrid? slight memory optimization
             # self.dynamic_field.hash_encoding = None
@@ -493,10 +444,6 @@ class UniSimModel(ADModel):
         )
         if self.config.use_hypernet:
             model_groups["fields"] += list(self.actor_embedding.parameters()) + list(self.actor_hypernet.parameters())
-            if self.config.use_class_specific_embedding:
-                model_groups["fields"] += list(self.class_embedding.parameters())
-            if self.config.use_shared_actor_embedding:
-                model_groups["fields"] += list(self.shared_actor_embedding.parameters())
         else:
             model_groups["fields"] += list(self.actor_hashgrids.parameters())
 
@@ -661,39 +608,13 @@ class UniSimModel(ADModel):
 
         return nff_outputs
 
-    def _get_actor_embeddings(self, actor_indices: Tensor) -> Tensor:
-        actor_embeddings = self.actor_embedding(actor_indices)
-        if self.config.use_class_specific_embedding:
-            if int(self.class_slider.value) == -1:
-                actor_classes = self.actor_classes[actor_indices]
-            else:
-                actor_classes = torch.ones_like(actor_indices) * int(self.class_slider.value)
-
-            class_embeddings = self.class_embedding(actor_classes)
-            if self.only_render_class.value:
-                z = class_embeddings
-            elif self.only_render_actor.value:
-                z = actor_embeddings
-            else:
-                z = actor_embeddings + class_embeddings
-        elif self.config.use_shared_actor_embedding:
-            if self.only_render_shared.value:
-                z = self.shared_actor_embedding(torch.tensor(0, device=actor_embeddings.device))
-            elif self.only_render_actor.value:
-                z = actor_embeddings
-            else:
-                z = actor_embeddings + self.shared_actor_embedding(torch.tensor(0, device=actor_embeddings.device))
-        else:
-            z = actor_embeddings
-        return z
-
     def _forward_dynamic_gauss_field(self, sampling: UniSimSampling, predict_normals: bool):
         assert sampling.dynamic_ray_samples is not None, "Dynamic ray samples must be provided"
         non_empty_sample_idx = sampling.dynamic_ray_samples.metadata[
             "object_indices"
         ].unique_consecutive()  # faster, as it's sorted
         if self.config.use_hypernet:
-            actor_embeddings = self._get_actor_embeddings(non_empty_sample_idx)
+            actor_embeddings = self.actor_embedding(non_empty_sample_idx)
             hashgrid_weights = self.actor_hypernet(actor_embeddings)
 
         w2b = sampling.dynamic_ray_samples.metadata["world2box"]
@@ -785,7 +706,7 @@ class UniSimModel(ADModel):
             "object_indices"
         ].unique_consecutive()  # faster, as it's sorted
         if self.config.use_hypernet:
-            actor_embeddings = self._get_actor_embeddings(non_empty_sample_idx)
+            actor_embeddings = self.actor_embedding(non_empty_sample_idx)
             hashgrid_weights = self.actor_hypernet(actor_embeddings)
 
         w2b = sampling.dynamic_ray_samples.metadata["world2box"]
@@ -916,16 +837,6 @@ class UniSimModel(ADModel):
         metrics_dict["sdf_to_density"] = self.sdf_to_density.beta.item()
         self.camera_optimizer.get_metrics_dict(metrics_dict)
 
-        if self.config.use_class_specific_embedding:
-            metrics_dict["actor_embedding_norm"] = self.actor_embedding.weight.norm(dim=-1).mean()
-            metrics_dict["class_embedding_norm"] = self.class_embedding.weight.norm(dim=-1).mean()
-
-        if self.config.use_shared_actor_embedding:
-            metrics_dict["actor_embedding_norm"] = self.actor_embedding.weight.norm(dim=-1).mean()
-            metrics_dict["shared_actor_embedding_norm"] = self.shared_actor_embedding.weight.norm(dim=-1).mean()
-
-        metrics_dict["motion_model_log_prob"] = self.dynamic_actors.get_motion_model_log_prob_for_trajectories()
-
         return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
@@ -948,13 +859,6 @@ class UniSimModel(ADModel):
             self.camera_optimizer.get_loss_dict(loss_dict)
             if "ray_drop_loss" in metrics_dict:
                 loss_dict["ray_drop_loss"] = self.config.ray_drop_loss_mult * metrics_dict["ray_drop_loss"]
-        # TODO: add all unisim losses
-        if self.config.use_class_specific_embedding or self.config.use_shared_actor_embedding:
-            loss_dict["actor_norm_loss"] = self.config.actor_norm_loss_mult * metrics_dict["actor_embedding_norm"]
-
-        loss_dict["motion_model_regularization_loss"] = (
-            -self.config.actor_motion_model_regularization_loss_mult * metrics_dict["motion_model_log_prob"]
-        )
 
         return loss_dict
 
