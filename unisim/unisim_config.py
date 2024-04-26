@@ -1,7 +1,6 @@
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.configs.base_config import ViewerConfig
 from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
-from nerfstudio.data.dataparsers.ad_dataparser import ADDataParserConfig
 from nerfstudio.data.dataparsers.pandaset_dataparser import PandaSetDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
@@ -81,7 +80,7 @@ unisim_plusplus = MethodSpecification(
         mixed_precision=True,
         pipeline=UniSimPipelineConfig(
             datamanager=ADDataManagerConfig(
-                dataparser=ADDataParserConfig(),
+                dataparser=PandaSetDataParserConfig(),
                 train_num_lidar_rays_per_batch=8192,
             ),
             model=UniSimModelConfig(
